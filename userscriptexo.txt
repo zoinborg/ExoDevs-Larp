@@ -1,0 +1,947 @@
+// ==UserScript==
+// @name         ExoDevs Larp
+// @namespace    http://tampermonkey.net/
+// @version      1.9
+// @description  Fake your Roblox profile locally. Press + to open menu.
+// @author       zoinborggithub
+// @match        https://*.roblox.com/*
+// @match        https://roblox.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      roblox.com
+// @connect      rbxcdn.com
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+    const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    // =====================================================================
+    // CONFIGURATION
+    // =====================================================================
+    const defaultConfig = {
+        username: '.gg/lomi', handle: '@god', robux: '1,000,000',
+        followers: '14.2K', following: '0', premium: true, limiteds: [],
+        hideFloatingButton: false, currencyPurchases: '', purchasedHistory: [],
+        showFullAmount: false, randomize: false,
+        identityId: '', identityEnabled: false,
+        identityAvatarUrl: '', identityHeadshotUrl: '',
+        identityUsername: '', identityDisplayName: '',
+        identityHasVerifiedBadge: false
+    };
+
+    let config = GM_getValue('larp_config', defaultConfig);
+    const saveConfig = () => GM_setValue('larp_config', config);
+    Object.keys(defaultConfig).forEach(k => { if (config[k] === undefined) config[k] = defaultConfig[k]; });
+    if (!config.handle) config.handle = '@' + (config.username || 'User');
+
+    // =====================================================================
+    // XHR HOOK
+    // =====================================================================
+    (function setupXHRHook() {
+        if (!config.identityEnabled || !config.identityId) return;
+
+        const targetId    = config.identityId;
+        const targetUN    = config.identityUsername   || 'User';
+        const targetDN    = config.identityDisplayName || targetUN;
+        const targetVerif = !!config.identityHasVerifiedBadge;
+        const headshotUrl = config.identityHeadshotUrl || config.identityAvatarUrl || '';
+        const robuxAmt    = parseInt((config.robux || '0').replace(/[^0-9]/g, '')) || 0;
+
+        const _open        = XMLHttpRequest.prototype.open;
+        const _send        = XMLHttpRequest.prototype.send;
+        const _response    = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+        const _responseText= Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+        const _status      = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'status');
+        const _NativeXHR   = XMLHttpRequest;
+
+        class LarpXHR extends _NativeXHR {
+            constructor(...args) {
+                super(...args);
+                this._open = _open; this._send = _send;
+                this._reqUrl = ''; this._method = '';
+                this.fakeCurrency = false; this.fakeUserInfo = false;
+                this.fakeHeadshot = false; this.fakeNotif = false;
+                this.fakeMessages = false; this.fakeFriendReq = false; this.fakeChat = false;
+
+                Object.defineProperty(this, 'status', {
+                    get: () => {
+                        if (this.fakeCurrency || this.fakeUserInfo || this.fakeNotif ||
+                            this.fakeMessages || this.fakeFriendReq || this.fakeChat) return 200;
+                        return _status.get.call(this);
+                    }, configurable: true
+                });
+                Object.defineProperty(this, 'response',     { get: () => this._getResp(false), configurable: true });
+                Object.defineProperty(this, 'responseText', { get: () => this._getResp(true),  configurable: true });
+            }
+
+            _getResp(asText) {
+                let data = null;
+                if (this.fakeCurrency)     { data = { robux: robuxAmt }; }
+                else if (this.fakeUserInfo){ data = { id: parseInt(targetId), name: targetUN, displayName: targetDN, hasVerifiedBadge: targetVerif, description: '', created: '2010-01-01T00:00:00Z', isBanned: false }; }
+                else if (this.fakeNotif)   { data = { unreadNotifications: 99, statusMessage: null }; }
+                else if (this.fakeMessages){ data = { count: 999 }; }
+                else if (this.fakeFriendReq){data = { count: 999 }; }
+                else if (this.fakeChat)    { data = { count: 99 }; }
+                else if (this.fakeHeadshot) {
+                    // Only patch AvatarHeadshot type entries — leave item/asset thumbnails alone
+                    try {
+                        const raw = _responseText.get.call(this);
+                        const parsed = JSON.parse(raw);
+                        if (parsed?.data && Array.isArray(parsed.data) && headshotUrl) {
+                            parsed.data = parsed.data.map(item => {
+                                const rid = (item.requestId || '').toLowerCase();
+                                if (rid.includes('avatarheadshot') || item.type === 'AvatarHeadshot') {
+                                    item.imageUrl = headshotUrl;
+                                }
+                                // Leave item/asset/outfit thumbnails untouched
+                                return item;
+                            });
+                        }
+                        return asText ? JSON.stringify(parsed) : parsed;
+                    } catch(e) {
+                        return asText ? _responseText.get.call(this) : _response.get.call(this);
+                    }
+                }
+                else { return asText ? _responseText.get.call(this) : _response.get.call(this); }
+                return data === null ? (asText ? '' : null) : (asText ? JSON.stringify(data) : data);
+            }
+
+            open(method, url, ...rest) {
+                this._method = method; this._reqUrl = url;
+                if (/\/v1\/users\/\d+\/currency/.test(url))        { this.fakeCurrency = true; }
+                else if (/\/v1\/users\/\d+$/.test(url))            { this.fakeUserInfo = true; }
+                // Only hook the dedicated headshot endpoint, NOT generic thumbnails batch
+                else if (url.includes('avatar-headshot') || (url.includes('thumbnails') && url.includes('AvatarHeadshot'))) {
+                    this.fakeHeadshot = true;
+                }
+                else if (url.includes('friends?userSort=') || (url.includes('/friends/') && !url.includes(targetId))) {
+                    const newUrl = url.replace(/\/users\/\d+\/friends/, `/users/${targetId}/friends`);
+                    if (newUrl !== url) return this._open.apply(this, [method, newUrl, ...rest]);
+                }
+                else if (url.includes('stream-notifications/unread-count')) { this.fakeNotif = true; }
+                else if (url.includes('messages/unread/count'))              { this.fakeMessages = true; }
+                else if (url.includes('friend-requests/count'))              { this.fakeFriendReq = true; }
+                else if (url.includes('get-unread-conversation-count'))      { this.fakeChat = true; }
+                return this._open.apply(this, [method, url, ...rest]);
+            }
+
+            send(...args) {
+                // In batch requests, only patch AvatarHeadshot entries for our user
+                if (this.fakeHeadshot && args[0] && typeof args[0] === 'string') {
+                    try {
+                        const parsed = JSON.parse(args[0]);
+                        if (Array.isArray(parsed)) {
+                            const meta = document.querySelector('meta[name="user-data"]');
+                            const origId = meta?.dataset?.larpOrigId || '';
+                            parsed.forEach(req => {
+                                if (origId && String(req.targetId) === origId && req.type === 'AvatarHeadshot') {
+                                    req.targetId = parseInt(targetId);
+                                    if (req.requestId) req.requestId = req.requestId.replace(origId, targetId);
+                                }
+                                // Leave Asset/Outfit/etc. requests completely alone
+                            });
+                            args[0] = JSON.stringify(parsed);
+                        }
+                    } catch(e) {}
+                }
+                return this._send.apply(this, args);
+            }
+        }
+
+        win.XMLHttpRequest = LarpXHR;
+        console.log('%c[LARP] XHR hook active →', 'color:#a855f7;font-weight:bold;', targetDN, `(${targetId})`);
+    })();
+
+    // =====================================================================
+    // FETCH HOOK
+    // =====================================================================
+    (function setupFetchHook() {
+        if (!config.identityEnabled || !config.identityId) return;
+        const targetId    = config.identityId;
+        const targetUN    = config.identityUsername   || 'User';
+        const targetDN    = config.identityDisplayName || targetUN;
+        const targetVerif = !!config.identityHasVerifiedBadge;
+        const headshotUrl = config.identityHeadshotUrl || config.identityAvatarUrl || '';
+        const robuxAmt    = parseInt((config.robux || '0').replace(/[^0-9]/g, '')) || 0;
+        const _fetch      = win.fetch.bind(win);
+
+        win.fetch = async function(input, init, ...rest) {
+            const url = typeof input === 'string' ? input : (input?.url || '');
+            if (/\/v1\/users\/\d+\/currency/.test(url)) {
+                return new Response(JSON.stringify({ robux: robuxAmt }), { status:200, headers:{'Content-Type':'application/json'} });
+            }
+            if (/\/v1\/users\/\d+$/.test(url)) {
+                return new Response(JSON.stringify({ id:parseInt(targetId), name:targetUN, displayName:targetDN, hasVerifiedBadge:targetVerif, description:'', created:'2010-01-01T00:00:00Z', isBanned:false }),
+                    { status:200, headers:{'Content-Type':'application/json'} });
+            }
+            // Only intercept dedicated headshot endpoints — NOT the generic batch which serves item thumbnails
+            if (headshotUrl && (url.includes('avatar-headshot') || (url.includes('AvatarHeadshot') && !url.includes('batch')))) {
+                try {
+                    const real = await _fetch(input, init, ...rest);
+                    const json = await real.clone().json();
+                    if (json?.data) json.data = json.data.map(item => ({ ...item, imageUrl: headshotUrl }));
+                    return new Response(JSON.stringify(json), { status:200, headers:{'Content-Type':'application/json'} });
+                } catch(e) {}
+            }
+            return _fetch(input, init, ...rest);
+        };
+    })();
+
+    // =====================================================================
+    // META TAG PATCH
+    // =====================================================================
+    (function patchMetaTag() {
+        if (!config.identityEnabled || !config.identityId) return;
+        const patch = () => {
+            const meta = document.querySelector('meta[name="user-data"]');
+            if (!meta) return false;
+            if (!meta.dataset.larpOrigId) {
+                meta.dataset.larpOrigId   = meta.getAttribute('data-userid')     || '';
+                meta.dataset.larpOrigName = meta.getAttribute('data-name')        || '';
+                meta.dataset.larpOrigDn   = meta.getAttribute('data-displayName') || '';
+            }
+            meta.setAttribute('data-userid',      config.identityId);
+            meta.setAttribute('data-name',        config.identityUsername);
+            meta.setAttribute('data-displayName', config.identityDisplayName);
+            return true;
+        };
+        if (!patch()) {
+            const obs = new MutationObserver(() => { if (patch()) obs.disconnect(); });
+            obs.observe(document.documentElement, { childList:true, subtree:true });
+        }
+    })();
+
+    // =====================================================================
+    // GLOBAL STYLES
+    // =====================================================================
+    const style = document.createElement('style');
+    style.id = 'larp-styles';
+    style.innerHTML = `
+        [data-testid="nav-robux-amount"]:not(.larp-faked),
+        #nav-robux-amount:not(.larp-faked), .robux-amount:not(.larp-faked),
+        .balance-value:not(.larp-faked), .my-balance-container .amount:not(.larp-faked) { visibility:hidden !important; }
+        .larp-faked { visibility:visible !important; }
+        .larp-buy-btn-injected { background:#a855f7; color:#fff; border:none; padding:12px 24px; font-size:15px;
+            font-weight:800; border-radius:12px; cursor:pointer; width:100%; margin-top:14px;
+            text-transform:uppercase; transition:all 0.2s; }
+        .larp-buy-btn-injected:hover { background:#bc72ff; transform:translateY(-2px); }
+        @keyframes larpFadeIn { from{opacity:0;transform:translate(-50%,-45%);} to{opacity:1;transform:translate(-50%,-50%);} }
+        #larp-menu.animate { animation:larpFadeIn 0.4s cubic-bezier(0.16,1,0.3,1) forwards; }
+        .larp-tab { transition:all 0.3s; position:relative; color:#666; opacity:0.7; }
+        .larp-tab:hover { opacity:1; color:#fff; }
+        .larp-tab.active { color:#a855f7; opacity:1; }
+        .larp-tab.active::after { content:""; position:absolute; bottom:0; left:20%; width:60%; height:3px;
+            background:linear-gradient(90deg,transparent,#a855f7,transparent); border-radius:10px; }
+        .larp-input-group label { display:block; font-size:11px; color:#7c3aed; margin-bottom:6px;
+            text-transform:uppercase; font-weight:800; letter-spacing:1.2px; }
+        .larp-input { width:100%; background:#0f0f0f; color:#fff; border:1px solid #1a1a1a;
+            padding:12px; border-radius:10px; outline:none; font-size:14px; transition:all 0.2s; box-sizing:border-box; }
+        .larp-input:focus { border-color:#a855f7; background:#141414; box-shadow:0 0 0 2px rgba(168,85,247,0.1); }
+        .larp-chk { display:flex; align-items:center; gap:12px; padding:10px; background:#111;
+            border-radius:10px; border:1px solid #1a1a1a; cursor:pointer; transition:0.2s; }
+        .larp-chk:hover { background:#161616; border-color:#2a2a2a; }
+        #larp-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:2147483646;
+            display:none; pointer-events:auto; backdrop-filter:blur(4px); }
+        .snowflake { position:fixed; top:-10px; color:#fff; user-select:none; z-index:2147483647;
+            pointer-events:none; animation:fall linear infinite; }
+        @keyframes fall { 0%{transform:translateY(0) rotate(0deg);opacity:1;} 100%{transform:translateY(100vh) rotate(360deg);opacity:0.3;} }
+        @keyframes slideFade { from{opacity:0;transform:translateX(10px);} to{opacity:1;transform:translateX(0);} }
+        .larp-content.active { display:block !important; animation:slideFade 0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
+        #larp-id-card { display:flex; align-items:center; gap:14px; background:#111; border-radius:12px;
+            padding:14px; border:1px solid #1a1a1a; margin-top:14px; }
+        #larp-id-avatar { width:60px; height:60px; border-radius:50%; border:2px solid #a855f7;
+            object-fit:cover; background:#1a1a1a; }
+        .larp-id-name { font-size:14px; font-weight:800; color:#fff; }
+        .larp-id-sub  { font-size:10px; color:#555; margin-top:2px; }
+        .larp-badge { font-size:10px; font-weight:700; padding:2px 8px; border-radius:20px; display:inline-block; margin-top:5px; }
+        .larp-badge-ok   { background:rgba(16,185,129,0.15); color:#10b981; }
+        .larp-badge-err  { background:rgba(239,68,68,0.15);  color:#ef4444; }
+        .larp-badge-load { background:rgba(168,85,247,0.15); color:#a855f7; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+
+    // =====================================================================
+    // IDENTITY FETCH
+    // =====================================================================
+    async function fetchIdentityData(userId) {
+        if (!userId || !/^\d+$/.test(userId.trim())) return null;
+        userId = userId.trim();
+        try {
+            const userRes = await new Promise((res,rej) => GM_xmlhttpRequest({ method:'GET', url:`https://users.roblox.com/v1/users/${userId}`, onload:res, onerror:rej }));
+            const user = JSON.parse(userRes.responseText);
+            if (!user.name) throw new Error('Not found');
+            const hsRes = await new Promise((res,rej) => GM_xmlhttpRequest({ method:'GET', url:`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`, onload:res, onerror:rej }));
+            const headshotUrl = JSON.parse(hsRes.responseText).data?.[0]?.imageUrl || '';
+            const avRes = await new Promise((res,rej) => GM_xmlhttpRequest({ method:'GET', url:`https://thumbnails.roblox.com/v1/users/avatar?userIds=${userId}&size=352x352&format=Png&isCircular=false`, onload:res, onerror:rej }));
+            const avatarUrl = JSON.parse(avRes.responseText).data?.[0]?.imageUrl || headshotUrl;
+            return { userId, username:user.name, displayName:user.displayName||user.name, hasVerifiedBadge:!!user.hasVerifiedBadge, headshotUrl, avatarUrl };
+        } catch(e) { return null; }
+    }
+
+    // =====================================================================
+    // CHECKBOX HELPER
+    // =====================================================================
+    const chkSVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="white"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`;
+    function mkChk(checked) {
+        return `<div style="width:18px;height:18px;border:2px solid ${checked?'#a855f7':'#333'};border-radius:4px;
+            display:flex;align-items:center;justify-content:center;flex-shrink:0;
+            background:${checked?'#a855f7':'transparent'};">${checked?chkSVG:''}</div>`;
+    }
+
+    // =====================================================================
+    // CREATE UI
+    // =====================================================================
+    let menu, gearBtn, larpOverlay;
+
+    const createUI = () => {
+        if (document.getElementById('larp-menu')) return;
+
+        larpOverlay = document.createElement('div');
+        larpOverlay.id = 'larp-overlay';
+        document.body.appendChild(larpOverlay);
+        for (let i=0;i<50;i++){
+            const s=document.createElement('div'); s.className='snowflake'; s.innerHTML='❄';
+            s.style.left=Math.random()*100+'vw'; s.style.animationDuration=(Math.random()*3+2)+'s';
+            s.style.opacity=Math.random(); s.style.fontSize=(Math.random()*10+10)+'px';
+            larpOverlay.appendChild(s);
+        }
+
+        menu = document.createElement('div');
+        menu.id = 'larp-menu'; menu.className = 'animate';
+        Object.assign(menu.style, {
+            position:'fixed', top:'50%', left:'50%', transform:'translate(-50%,-50%)',
+            width:'430px', backgroundColor:'#0a0a0a', color:'#e0e0e0', padding:'0',
+            borderRadius:'20px', zIndex:'2147483647', display:'none',
+            fontFamily:'"Segoe UI",Roboto,Helvetica,Arial,sans-serif',
+            boxShadow:'0 25px 60px rgba(0,0,0,0.9),0 0 30px rgba(168,85,247,0.15)',
+            border:'1px solid #33214a', overflow:'hidden', maxHeight:'90vh', overflowY:'auto'
+        });
+
+        const idActive = config.identityEnabled && config.identityId;
+
+        menu.innerHTML = `
+        <div style="background:linear-gradient(180deg,#111,#0a0a0a);padding:20px;text-align:center;border-bottom:1px solid #1a1a1a;">
+            <h1 style="margin:0;font-size:22px;letter-spacing:3px;color:#fff;text-transform:lowercase;font-weight:900;filter:drop-shadow(0 0 10px rgba(168,85,247,0.5));">lomi larped exodevz</h1>
+            <p style="margin:5px 0 0;font-size:10px;color:#a855f7;font-weight:800;letter-spacing:2px;text-transform:uppercase;">.gg/lomi</p>
+            ${idActive?`<div style="margin-top:8px;padding:4px 12px;background:rgba(168,85,247,0.15);border-radius:20px;font-size:10px;color:#a855f7;font-weight:800;display:inline-block;">⚡ IDENTITY: ${config.identityDisplayName||config.identityUsername}</div>`:''}
+        </div>
+        <div style="display:flex;background:#050505;border-bottom:1px solid #1a1a1a;">
+            <div class="larp-tab active" data-tab="profile"  style="flex:1;padding:13px 0;text-align:center;cursor:pointer;font-size:9px;font-weight:800;letter-spacing:1px;">PROFILE</div>
+            <div class="larp-tab" data-tab="identity" style="flex:1;padding:13px 0;text-align:center;cursor:pointer;font-size:9px;font-weight:800;letter-spacing:1px;${idActive?'color:#a855f7;opacity:1;':''}">ID${idActive?' ⚡':''}</div>
+            <div class="larp-tab" data-tab="robux"    style="flex:1;padding:13px 0;text-align:center;cursor:pointer;font-size:9px;font-weight:800;letter-spacing:1px;">ROBUX</div>
+            <div class="larp-tab" data-tab="limiteds" style="flex:1;padding:13px 0;text-align:center;cursor:pointer;font-size:9px;font-weight:800;letter-spacing:1px;">LIMITEDS</div>
+            <div class="larp-tab" data-tab="settings" style="flex:1;padding:13px 0;text-align:center;cursor:pointer;font-size:9px;font-weight:800;letter-spacing:1px;">SETTINGS</div>
+        </div>
+
+        <!-- PROFILE -->
+        <div id="tab-profile" class="larp-content active" style="padding:22px;display:none;">
+            <div class="larp-input-group" style="margin-bottom:14px;"><label>Display Name</label><input id="larp-user" type="text" class="larp-input" value="${config.username}"></div>
+            <div class="larp-input-group" style="margin-bottom:14px;"><label>Handle / Username</label><input id="larp-handle" type="text" class="larp-input" value="${config.handle}" placeholder="@yourhandle"></div>
+            <div style="display:flex;gap:14px;margin-bottom:14px;">
+                <div class="larp-input-group" style="flex:1;"><label>Followers</label><input id="larp-followers" type="text" class="larp-input" value="${config.followers}"></div>
+                <div class="larp-input-group" style="flex:1;"><label>Following</label><input id="larp-following" type="text" class="larp-input" value="${config.following}"></div>
+            </div>
+            <label class="larp-chk">
+                <input id="larp-premium" type="checkbox" ${config.premium?'checked':''} style="display:none">
+                <div id="larp-premium-box">${mkChk(config.premium)}</div>
+                <span style="font-size:13px;color:#aaa;font-weight:600;">Enable Premium Badge</span>
+            </label>
+        </div>
+
+        <!-- IDENTITY -->
+        <div id="tab-identity" class="larp-content" style="padding:22px;display:none;">
+            <div style="font-size:11px;color:#555;line-height:1.8;margin-bottom:14px;">
+                Intercepts XHR + fetch at API level. The site believes you <em>are</em> this user.<br>
+                <span style="color:#a855f7;font-weight:700;">Look Up → Commit Changes → reloads.</span>
+            </div>
+            <div class="larp-input-group" style="margin-bottom:12px;">
+                <label>Roblox User ID</label>
+                <div style="display:flex;gap:8px;">
+                    <input id="larp-identity-id" type="text" class="larp-input" placeholder="e.g. 80254" value="${config.identityId}" style="flex:1;">
+                    <button id="larp-identity-fetch" style="background:#a855f7;color:#fff;border:none;padding:0 14px;border-radius:10px;font-weight:800;cursor:pointer;font-size:11px;white-space:nowrap;height:44px;">Look Up</button>
+                </div>
+            </div>
+            <div id="larp-id-status-wrap" style="font-size:11px;font-weight:700;margin-bottom:4px;"></div>
+            <div id="larp-id-card" style="display:${idActive?'flex':'none'};">
+                <img id="larp-id-avatar" src="${config.identityHeadshotUrl||''}" alt="">
+                <div>
+                    <div class="larp-id-name" id="larp-id-name">${config.identityDisplayName||''}</div>
+                    <div class="larp-id-sub"  id="larp-id-sub">@${config.identityUsername||''} · ID: ${config.identityId||''}</div>
+                    <span class="larp-badge ${idActive?'larp-badge-ok':''}" id="larp-id-badge">${idActive?'⚡ Active':''}</span>
+                </div>
+            </div>
+            <div style="margin-top:16px;">
+                <label class="larp-chk">
+                    <input id="larp-identity-enabled" type="checkbox" ${config.identityEnabled?'checked':''} style="display:none">
+                    <div id="larp-id-enabled-box">${mkChk(config.identityEnabled)}</div>
+                    <div>
+                        <div style="font-size:13px;color:#fff;font-weight:700;">Enable Identity Spoofing</div>
+                        <div style="font-size:10px;color:#555;margin-top:2px;">XHR + fetch + meta tag hooks</div>
+                    </div>
+                </label>
+            </div>
+            <div style="margin-top:14px;padding:12px;background:rgba(168,85,247,0.05);border-radius:10px;border:1px solid rgba(168,85,247,0.1);font-size:10px;color:#555;line-height:1.9;">
+                <b style="color:#7c3aed;">Spoofed (nav/profile only — items/badges untouched):</b><br>
+                • Nav bar avatar headshot → target's face<br>
+                • Profile header avatar → target's face<br>
+                • Currency / user info API responses<br>
+                • meta[name="user-data"] user ID + name<br>
+                • Notification / message / friend counts<br>
+                • Friends list → redirected to target's<br>
+                • Add Connection → Edit Profile on profile page
+            </div>
+        </div>
+
+        <!-- ROBUX -->
+        <div id="tab-robux" class="larp-content" style="padding:22px;display:none;">
+            <div class="larp-input-group" style="margin-bottom:18px;"><label>Balance</label><input id="larp-rbx" type="text" class="larp-input" value="${config.robux}" style="color:#ffb000;font-weight:900;font-size:18px;"></div>
+            <div class="larp-input-group" style="margin-bottom:18px;"><label>Currency Purchase Override</label><input id="larp-sales" type="text" class="larp-input" value="${config.currencyPurchases}" placeholder="Syncs with Balance if empty"></div>
+            <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
+                <label class="larp-chk"><input id="larp-full-rbx" type="checkbox" ${config.showFullAmount?'checked':''} style="display:none">${mkChk(config.showFullAmount)}<span style="font-size:12px;color:#888;">Show full digits</span></label>
+                <label class="larp-chk"><input id="larp-randomize" type="checkbox" ${config.randomize?'checked':''} style="display:none">${mkChk(config.randomize)}<span style="font-size:12px;color:#888;">Realistic jitter</span></label>
+            </div>
+            <div style="background:rgba(168,85,247,0.05);padding:14px;border-radius:12px;border:1px solid rgba(168,85,247,0.1);">
+                <div style="font-size:10px;color:#a855f7;text-transform:uppercase;font-weight:800;letter-spacing:1px;margin-bottom:8px;">Preview</div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#666;font-weight:600;"><span>Projected Sales:</span><span id="larp-robux-preview" style="color:#00b06f;font-weight:800;">+---</span></div>
+            </div>
+        </div>
+
+        <!-- LIMITEDS -->
+        <div id="tab-limiteds" class="larp-content" style="padding:22px;display:none;">
+            <div class="larp-input-group" style="margin-bottom:18px;"><label>Add Asset (URL)</label>
+                <div style="display:flex;gap:8px;">
+                    <input id="larp-lim-url" type="text" class="larp-input" placeholder="https://roblox.com/catalog/...">
+                    <button id="larp-add-lim" style="background:#a855f7;color:#fff;border:none;padding:0 15px;border-radius:10px;font-weight:800;cursor:pointer;height:44px;">+</button>
+                </div>
+            </div>
+            <div id="larp-limiteds-list" style="max-height:220px;overflow-y:auto;background:#050505;border-radius:12px;border:1px solid #1a1a1a;padding:8px;"></div>
+        </div>
+
+        <!-- SETTINGS -->
+        <div id="tab-settings" class="larp-content" style="padding:22px;display:none;">
+            <label class="larp-chk" style="margin-bottom:18px;">
+                <input id="larp-hide-btn" type="checkbox" ${config.hideFloatingButton?'checked':''} style="display:none">
+                ${mkChk(config.hideFloatingButton)}
+                <span style="font-size:13px;color:#aaa;font-weight:600;">Hide Floating Button</span>
+            </label>
+            <div style="border-top:1px solid #1a1a1a;padding-top:18px;">
+                <button id="larp-reset" style="width:100%;padding:13px;background:transparent;color:#ef4444;border:1px solid #ef4444;cursor:pointer;font-weight:800;border-radius:12px;font-size:12px;text-transform:uppercase;">Wipe All Settings</button>
+            </div>
+        </div>
+
+        <div style="padding:0 22px 22px;">
+            <button id="larp-save" style="width:100%;padding:15px;background:linear-gradient(135deg,#a855f7,#7c3aed);color:#fff;border:none;cursor:pointer;font-weight:900;border-radius:12px;font-size:14px;text-transform:uppercase;letter-spacing:2px;box-shadow:0 10px 20px rgba(124,58,237,0.3);">Commit Changes</button>
+        </div>`;
+
+        document.body.appendChild(menu);
+
+        gearBtn = document.createElement('button');
+        gearBtn.id = 'larp-gear-btn'; gearBtn.textContent = '⚙️';
+        Object.assign(gearBtn.style, {
+            position:'fixed', bottom:'25px', left:'25px', zIndex:'2147483646',
+            width:'45px', height:'45px', background:'linear-gradient(135deg,#a855f7,#6d28d9)',
+            color:'#fff', border:'none', borderRadius:'12px', cursor:'pointer', fontSize:'22px',
+            boxShadow:'0 8px 25px rgba(124,58,237,0.4)',
+            display: config.hideFloatingButton ? 'none' : 'flex',
+            alignItems:'center', justifyContent:'center', transition:'all 0.3s'
+        });
+        gearBtn.onclick = () => {
+            const h = menu.style.display === 'none';
+            menu.style.display = h ? 'block' : 'none';
+            larpOverlay.style.display = h ? 'block' : 'none';
+            if (h) { menu.classList.remove('animate'); void menu.offsetWidth; menu.classList.add('animate'); }
+        };
+        document.body.appendChild(gearBtn);
+
+        // Tabs
+        menu.querySelectorAll('.larp-tab').forEach(tab => {
+            tab.onclick = () => {
+                if (tab.classList.contains('active')) return;
+                menu.querySelectorAll('.larp-tab').forEach(t => t.classList.remove('active'));
+                menu.querySelectorAll('.larp-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                menu.querySelector('#tab-'+tab.dataset.tab)?.classList.add('active');
+            };
+        });
+
+        // Identity
+        const idInput      = document.getElementById('larp-identity-id');
+        const lookupBtn    = document.getElementById('larp-identity-fetch');
+        const idCard       = document.getElementById('larp-id-card');
+        const idAvatar     = document.getElementById('larp-id-avatar');
+        const idNameEl     = document.getElementById('larp-id-name');
+        const idSubEl      = document.getElementById('larp-id-sub');
+        const idBadge      = document.getElementById('larp-id-badge');
+        const idStatusWrap = document.getElementById('larp-id-status-wrap');
+        const idEnabledCB  = document.getElementById('larp-identity-enabled');
+        const idEnabledBox = document.getElementById('larp-id-enabled-box');
+        let pendingIdentity = null;
+
+        idEnabledBox.onclick = () => { idEnabledCB.checked = !idEnabledCB.checked; idEnabledBox.innerHTML = mkChk(idEnabledCB.checked); };
+
+        lookupBtn.onclick = async () => {
+            const uid = idInput.value.trim();
+            if (!uid || !/^\d+$/.test(uid)) { idStatusWrap.innerHTML=`<span class="larp-badge larp-badge-err">❌ Invalid ID</span>`; return; }
+            idStatusWrap.innerHTML = `<span class="larp-badge larp-badge-load">⏳ Looking up...</span>`;
+            idCard.style.display = 'none';
+            const result = await fetchIdentityData(uid);
+            if (!result) { idStatusWrap.innerHTML=`<span class="larp-badge larp-badge-err">❌ User not found</span>`; pendingIdentity=null; return; }
+            pendingIdentity = result;
+            idAvatar.src = result.headshotUrl;
+            idNameEl.textContent = result.displayName;
+            idSubEl.textContent  = `@${result.username} · ID: ${result.userId}${result.hasVerifiedBadge?' ✓':''}`;
+            idBadge.className    = 'larp-badge larp-badge-ok';
+            idBadge.textContent  = '✓ Found — Commit to apply';
+            idCard.style.display = 'flex';
+            idStatusWrap.innerHTML = '';
+        };
+
+        document.getElementById('larp-premium-box').onclick = () => {
+            const cb = document.getElementById('larp-premium'); cb.checked=!cb.checked;
+            document.getElementById('larp-premium-box').innerHTML = mkChk(cb.checked);
+        };
+
+        document.getElementById('larp-save').onclick = () => {
+            try {
+                config.username          = document.getElementById('larp-user').value;
+                config.handle            = document.getElementById('larp-handle').value;
+                config.followers         = document.getElementById('larp-followers').value;
+                config.following         = document.getElementById('larp-following').value;
+                config.robux             = document.getElementById('larp-rbx').value;
+                config.currencyPurchases = document.getElementById('larp-sales').value;
+                config.showFullAmount    = document.getElementById('larp-full-rbx').checked;
+                config.randomize         = document.getElementById('larp-randomize').checked;
+                config.premium           = document.getElementById('larp-premium').checked;
+                config.hideFloatingButton= document.getElementById('larp-hide-btn').checked;
+                config.identityEnabled   = idEnabledCB.checked;
+                config.identityId        = idInput.value.trim();
+                if (pendingIdentity) {
+                    config.identityHeadshotUrl      = pendingIdentity.headshotUrl;
+                    config.identityAvatarUrl        = pendingIdentity.avatarUrl;
+                    config.identityUsername         = pendingIdentity.username;
+                    config.identityDisplayName      = pendingIdentity.displayName;
+                    config.identityHasVerifiedBadge = pendingIdentity.hasVerifiedBadge;
+                }
+                if (!config.handle.startsWith('@')) config.handle = '@' + config.handle;
+                saveConfig(); win.location.reload();
+            } catch(e) { alert('Save error: '+e); }
+        };
+
+        const updatePreview = () => {
+            const v = document.getElementById('larp-sales').value || document.getElementById('larp-rbx').value;
+            document.getElementById('larp-robux-preview').textContent = '+' + getFakedAmount(v);
+        };
+        document.getElementById('larp-rbx').oninput = updatePreview;
+        document.getElementById('larp-sales').oninput = updatePreview;
+        updatePreview();
+
+        document.getElementById('larp-reset').onclick = () => { if (confirm('Reset all settings?')) { GM_setValue('larp_config',defaultConfig); win.location.reload(); } };
+        document.getElementById('larp-add-lim').onclick = () => { const u=document.getElementById('larp-lim-url').value; if(u) addLimited(u); };
+        renderLimiteds();
+    };
+
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
+    const formatNum = n => n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    const toShorthand = n => n<1000 ? n.toString() : n<1e6 ? (n/1000).toFixed(1).replace(/\.0$/,'')+'K+' : (n/1e6).toFixed(1).replace(/\.0$/,'')+'M+';
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const getFakedAmount = (str) => {
+        if (!str) return '0';
+        const raw=str.toString().replace(/[^0-9.KkMm]/g,'');
+        const low=raw.toLowerCase();
+        let amt=low.includes('m')?parseFloat(raw)*1e6:low.includes('k')?parseFloat(raw)*1000:parseInt(raw)||0;
+        if (config.randomize&&amt>1000&&amt%1000===0) amt+=8731;
+        return formatNum(Math.floor(amt));
+    };
+
+    async function addLimited(url) {
+        const m=url.match(/\/catalog\/(\d+)\//)||url.match(/\/bundles\/(\d+)\//);
+        if (!m) return alert('Invalid URL');
+        const id=m[1];
+        try {
+            const ir=await new Promise(r=>GM_xmlhttpRequest({method:'GET',url:`https://catalog.roblox.com/v1/catalog/items/${id}/details?itemType=Asset`,onload:r}));
+            const info=JSON.parse(ir.responseText);
+            const tr=await new Promise(r=>GM_xmlhttpRequest({method:'GET',url:`https://thumbnails.roblox.com/v1/assets?assetIds=${id}&size=150x150&format=Png`,onload:r}));
+            const thumb=JSON.parse(tr.responseText).data?.[0]?.imageUrl||'';
+            config.limiteds.push({id,name:info.name||'Item',thumb,equipped:true,isLimited:true,price:info.price||'0'});
+            saveConfig();renderLimiteds();
+        } catch(e){alert('Error fetching item');}
+    }
+
+    function renderLimiteds() {
+        const c=document.getElementById('larp-limiteds-list'); if(!c)return;
+        c.innerHTML=config.limiteds.length?'':'<p style="font-size:11px;color:#444;text-align:center;padding:16px;">Empty</p>';
+        config.limiteds.forEach((item,i)=>{
+            const d=document.createElement('div');
+            d.style.cssText='display:flex;align-items:center;background:#111;padding:10px;border-radius:10px;margin-bottom:8px;border:1px solid #1a1a1a;gap:10px;';
+            d.innerHTML=`<img src="${item.thumb}" style="width:40px;height:40px;border-radius:6px;object-fit:contain;">
+                <div style="flex:1;overflow:hidden;"><div style="font-size:12px;color:#fff;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${item.name}</div><div style="font-size:10px;color:#666;">ID: ${item.id}</div></div>
+                <button style="color:#444;background:none;border:none;cursor:pointer;font-size:18px;">×</button>`;
+            d.querySelector('button').onclick=()=>{config.limiteds.splice(i,1);saveConfig();renderLimiteds();};
+            c.appendChild(d);
+        });
+    }
+
+    // =====================================================================
+    // DOM-LEVEL IDENTITY FAKING
+    // Only replaces actual player headshots — NOT item/badge/game/group thumbnails
+    // =====================================================================
+    function isAvatarHeadshotSrc(src) {
+        if (!src) return false;
+        // Roblox CDN headshot URLs contain "AvatarHeadshot" in the path
+        // Item thumbnails use /assets/, /catalog/, or just plain asset IDs
+        return src.includes('AvatarHeadshot') || src.includes('avatar-headshot');
+    }
+
+    // Selectors for containers that hold the PLAYER's own avatar (nav + profile header only)
+    // These are very specific — we don't want to touch item carousels, badge grids, group tiles, etc.
+    const NAV_SELECTORS = [
+        '.age-bracket-label .avatar',            // old site nav avatar link
+        '.age-bracket-label .thumbnail-2d-container img', // old site nav headshot img
+        '.rbx-navbar-right .avatar-headshot-xs img',
+        '[data-testid*="nav"] .thumbnail-2d-container img',
+        '.nav-header-content .thumbnail-2d-container img',
+        // new site nav
+        'header .thumbnail-2d-container img',
+        'nav .thumbnail-2d-container img',
+    ].join(',');
+
+    // Profile header avatar (large one at top of profile page, NOT items in carousels below)
+    const PROFILE_HEADER_SELECTORS = [
+        '.profile-avatar-left img',
+        '.profile-avatar-container img',
+        '[data-testid="profile-avatar"] img',
+        '.avatar-card-image img',
+        '.profile-header .thumbnail-2d-container img',
+        '.profile-header-left .thumbnail-2d-container img',
+        '[class*="profileAvatarWrapper"] img',
+        '[class*="avatar-container"] img:not([class*="item"]):not([class*="badge"])',
+    ].join(',');
+
+    function applyIdentityFakes() {
+        if (!config.identityEnabled || !config.identityId) return;
+        const hs  = config.identityHeadshotUrl || config.identityAvatarUrl || '';
+        const tid = config.identityId;
+        const dn  = config.identityDisplayName || config.identityUsername || '';
+        if (!hs) return;
+
+        // 1. Replace nav avatar images — only images whose src is already a headshot CDN URL
+        //    OR images that are direct children of known nav avatar containers
+        document.querySelectorAll(NAV_SELECTORS).forEach(img => {
+            if (img.closest('#larp-menu,#larp-buy-overlay,#larp-purchase-modal')) return;
+            if (img.dataset.larpId === 'nav') return;
+            img.src = hs; img.alt = dn; img.title = dn;
+            img.dataset.larpId = 'nav';
+        });
+
+        // 2. Replace any img whose src is explicitly an AvatarHeadshot CDN URL
+        //    (covers nav icons that didn't match the selectors above)
+        document.querySelectorAll('img').forEach(img => {
+            if (img.closest('#larp-menu,#larp-buy-overlay,#larp-purchase-modal')) return;
+            if (img.dataset.larpId) return; // already handled
+            // Skip images inside item carousels, badge lists, game cards, group tiles, store sections
+            if (img.closest('.item-card,.profile-item-card,.badge-list,.game-card,.base-tile,.asset-item,.outfit-card,.item-cards-stackable,.game-card-thumb-container')) return;
+            if (img.closest('#avatar-items-container,#player-badges-container,.profile-collections,.profile-store,.profile-communities,.profile-currently-wearing,.favorite-games-container')) return;
+            // Only replace if the src is a headshot URL
+            if (isAvatarHeadshotSrc(img.src)) {
+                img.src = hs; img.alt = dn; img.title = dn;
+                img.dataset.larpId = 'headshot';
+            }
+        });
+
+        // 3. Profile header avatar
+        document.querySelectorAll(PROFILE_HEADER_SELECTORS).forEach(img => {
+            if (img.closest('#larp-menu,#larp-buy-overlay,#larp-purchase-modal')) return;
+            if (img.dataset.larpId === 'profile') return;
+            if (img.closest('.item-card,.badge-list,.game-card,.base-tile,.asset-item')) return;
+            img.src = hs; img.alt = dn; img.title = dn;
+            img.dataset.larpId = 'profile';
+        });
+
+        // 4. Patch profile nav link
+        document.querySelectorAll('a[href*="/users/profile"]').forEach(a => {
+            const nh = `/users/${tid}/profile`;
+            if (a.getAttribute('href') !== nh) a.setAttribute('href', nh);
+        });
+
+        // 5. Add Connection → Edit Profile on profile page
+        const metaId = document.querySelector('meta[name="user-data"]')?.getAttribute('data-userid');
+        const pgId   = win.location.href.match(/\/users\/(\d+)\//)?.[1];
+        if (pgId && (pgId === tid || pgId === metaId)) {
+            const addBtn = document.getElementById('user-profile-header-AddFriend');
+            if (addBtn && !document.getElementById('user-profile-header-EditProfile')) {
+                const group    = addBtn.closest('.flex.gap-small') || addBtn.parentElement;
+                const threeDots = document.getElementById('user-profile-header-contextual-menu-button');
+                const tdHTML   = threeDots ? threeDots.outerHTML : '';
+                const wrap = group || addBtn.parentElement;
+                wrap.outerHTML = `
+                <div class="flex gap-small buttons-show-on-desktop">
+                    <div class="button-container flex gap-small">
+                        <button type="button" id="user-profile-header-EditProfile"
+                            class="foundation-web-button relative clip group/interactable focus-visible:outline-focus disabled:outline-none cursor-pointer relative flex items-center justify-center stroke-none padding-y-none select-none radius-medium text-label-medium height-1000 padding-x-medium bg-action-standard content-action-standard"
+                            style="text-decoration:none;width:100%;">
+                            <div role="presentation" class="absolute inset-[0] transition-colors group-hover/interactable:bg-[var(--color-state-hover)]"></div>
+                            <span class="flex items-center min-width-0 gap-small"><span class="padding-y-xsmall text-truncate-end text-no-wrap">Edit Profile</span></span>
+                        </button>
+                        <a id="user-profile-header-EditAvatar" href="/my/avatar"
+                            class="foundation-web-button relative clip group/interactable focus-visible:outline-focus disabled:outline-none cursor-pointer relative flex items-center justify-center stroke-none padding-y-none select-none radius-medium text-label-medium height-1000 padding-x-medium bg-action-standard content-action-standard"
+                            style="text-decoration:none;width:100%;">
+                            <div role="presentation" class="absolute inset-[0] transition-colors group-hover/interactable:bg-[var(--color-state-hover)]"></div>
+                            <span class="flex items-center min-width-0 gap-small"><span class="padding-y-xsmall text-truncate-end text-no-wrap">Edit Avatar</span></span>
+                        </a>
+                    </div>
+                    <div>${tdHTML}</div>
+                </div>`;
+            }
+        }
+    }
+
+    // =====================================================================
+    // CORE APPLY FAKES
+    // =====================================================================
+    let isUpdating = false, observer = null, lastRun = 0, txInterval = null;
+
+    function throttle(fn, ms) {
+        return function() { const n=Date.now(); if(n-lastRun>=ms){lastRun=n;fn.apply(this,arguments);} };
+    }
+
+    function applyFakes() {
+        if (isUpdating) return;
+        isUpdating = true;
+        if (observer) observer.disconnect();
+        try {
+            const totalAmt   = parseInt(getFakedAmount(config.robux).replace(/[^0-9]/g,''));
+            const fullRbxStr = getFakedAmount(config.robux);
+            const shorthand  = config.showFullAmount ? fullRbxStr : toShorthand(totalAmt);
+            const salesAmt   = getFakedAmount(config.currencyPurchases || config.robux);
+
+            const metaEl  = document.querySelector('meta[name="user-data"]');
+            const origId  = metaEl?.dataset?.larpOrigId   || '';
+            const origUN  = metaEl?.dataset?.larpOrigName || '';
+            const origDN  = metaEl?.dataset?.larpOrigDn   || '';
+            const realUN  = win.Roblox?.CurrentUser?.name        || origUN || '';
+            const realDN  = win.Roblox?.CurrentUser?.displayName || origDN || '';
+            const targetUN = config.identityEnabled ? (config.identityUsername   || '') : '';
+            const targetDN = config.identityEnabled ? (config.identityDisplayName || '') : '';
+
+            const pgId    = win.location.href.match(/\/users\/(\d+)\//)?.[1] || '';
+            const tid     = config.identityId || '';
+            const isOwnPg = pgId && (pgId === (origId || win.Roblox?.CurrentUser?.userId?.toString()) || pgId === tid);
+
+            const wantDN  = config.username;
+            const wantUN  = (config.handle || '').replace(/^@/,'');
+
+            // Text node walk — names, handle, stats
+            const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let nd;
+            while ((nd = walk.nextNode())) {
+                const p = nd.parentElement;
+                if (!p || ['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(p.tagName)) continue;
+                if (p.closest('#larp-menu,#larp-purchase-modal,#larp-buy-overlay')) continue;
+                if (p.closest('.chat-main,.chat-container,.friend-list,.people-list,.group-members-list')) continue;
+                if (p.closest('.profile-header,.header-title-container,.profile-display-name-container') && !isOwnPg) continue;
+
+                let v = nd.nodeValue; let changed = false;
+
+                if (realDN && v.includes(realDN))               { v=v.replace(new RegExp(esc(realDN),'g'),wantDN); changed=true; }
+                if (realUN && v.includes(realUN))               { v=v.replace(new RegExp(esc(realUN),'g'),wantUN); changed=true; }
+                if (targetDN && targetDN!==realDN && v.includes(targetDN)) { v=v.replace(new RegExp(esc(targetDN),'g'),wantDN); changed=true; }
+                if (targetUN && targetUN!==realUN && v.includes(targetUN)) { v=v.replace(new RegExp(esc(targetUN),'g'),wantUN); changed=true; }
+                if (targetUN && v.includes('@'+targetUN)) { v=v.replace(new RegExp('@'+esc(targetUN),'g'),config.handle||('@'+wantUN)); changed=true; }
+                if (realUN   && v.includes('@'+realUN))   { v=v.replace(new RegExp('@'+esc(realUN),'g'),  config.handle||('@'+wantUN)); changed=true; }
+                if (changed) nd.nodeValue = v;
+
+                if (isOwnPg) {
+                    const stats = p.closest('.stats-list,.profile-stats-container');
+                    if (stats) {
+                        let sv=nd.nodeValue;
+                        if (sv.includes('Followers')) nd.nodeValue=sv.replace(/\d+[\d.,KkMm]*/,config.followers||'0');
+                        if (sv.includes('Following')) nd.nodeValue=sv.replace(/\d+[\d.,KkMm]*/,config.following||'0');
+                    }
+                }
+            }
+
+            // Nav username text
+            document.querySelectorAll('.age-bracket-label-username,.nav-username,.rbx-header-name').forEach(el => {
+                if (el.closest('#larp-menu')) return;
+                const cur=el.textContent.trim();
+                if (cur===realUN||cur===targetUN) el.textContent=wantUN;
+            });
+
+            // Robux
+            document.querySelectorAll('#nav-robux-amount,[data-testid="nav-robux-amount"],.rbx-menu-item-text.robux-amount,.robux-amount,#nav-robux-balance,.balance-value,.amount-text').forEach(el => {
+                if (el.dataset.larpVal===shorthand){el.classList.add('larp-faked');return;}
+                if (el.closest('tr')?.textContent.includes('Sales of Goods')||el.closest('.summary-row')?.textContent.includes('Sales of Goods')) return;
+                el.textContent=shorthand;el.dataset.larpVal=shorthand;el.classList.add('larp-faked');
+            });
+
+            // Transactions
+            if (win.location.href.includes('/transactions')) {
+                document.querySelectorAll('.balance-label').forEach(el=>{
+                    const w2=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,null,false);let n2;
+                    while((n2=w2.nextNode()))if(/\d/.test(n2.nodeValue)&&!n2.nodeValue.includes(fullRbxStr))n2.nodeValue=n2.nodeValue.replace(/[\d,]+/,fullRbxStr);
+                    el.classList.add('larp-faked');
+                });
+                document.querySelectorAll('.balance-value,.my-balance-container .amount').forEach(el=>{
+                    if(el.textContent.trim()!==fullRbxStr)el.textContent=fullRbxStr;el.classList.add('larp-faked');
+                });
+                const fixTx=()=>{
+                    const labs=document.evaluate("//*[contains(text(),'Currency Purchases') or contains(text(),'Sales of Goods')]",document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);
+                    for(let i=0;i<labs.snapshotLength;i++){
+                        const row=labs.snapshotItem(i).closest('tr')||labs.snapshotItem(i).closest('.summary-row');if(!row)continue;
+                        const cell=row.lastElementChild||row.querySelector('.amount');if(!cell)continue;
+                        const w3=document.createTreeWalker(cell,NodeFilter.SHOW_TEXT,null,false);let n3;
+                        while((n3=w3.nextNode()))if(/\d/.test(n3.nodeValue)&&!n3.nodeValue.includes(salesAmt))n3.nodeValue=n3.nodeValue.replace(/[\d,.]+/,salesAmt);
+                    }
+                };
+                fixTx();
+                if(!txInterval)txInterval=setInterval(fixTx,1000);
+            } else if(txInterval){clearInterval(txInterval);txInterval=null;}
+
+            // Premium
+            if (config.premium) {
+                document.querySelectorAll('.header-title,.profile-display-name').forEach(el=>{
+                    if(!el.querySelector('.icon-premium-medium')){
+                        const b=document.createElement('span');b.className='icon-premium-medium';b.style.marginLeft='8px';el.appendChild(b);
+                    }
+                });
+            }
+
+            // Inventory
+            if((win.location.href.includes('/inventory')||win.location.href.includes('/avatar'))&&config.limiteds.length){
+                const grid=document.querySelector('.items-list,.item-cards-stackable,#assetsList,.item-cards-container');
+                if(grid)config.limiteds.forEach(item=>{
+                    const lid=`larp-inv-${item.id}`;if(document.getElementById(lid))return;
+                    const li=document.createElement('li');li.id=lid;li.className='list-item item-card six-column';
+                    li.innerHTML=`<div></div><div class="item-card-container" style="border-radius:8px;overflow:hidden;"><div class="item-card-link" style="border-radius:8px;"><a href="/catalog/${item.id}/" class="item-card-thumb-container"><div class="item-card-thumb" style="border-radius:8px;"><span class="thumbnail-2d-container"><img src="${item.thumb}" alt="${item.name}" style="width:100%;height:100%;object-fit:contain;border-radius:8px;"></span></div>${item.isLimited?'<span class="restriction-icon icon-limited-unique-label"></span>':''}</a></div><div class="item-card-caption"><a href="/catalog/${item.id}/" class="item-card-name-link"><div class="text-overflow item-card-name">${item.name}</div></a></div></div>`;
+                    grid.tagName==='UL'?grid.prepend(li):(li.style.display='inline-block',grid.prepend(li));
+                });
+            }
+
+            // Force robux visibility
+            document.querySelectorAll('#nav-robux-amount,[data-testid="nav-robux-amount"],.robux-amount,.balance-label,.balance-value,.my-balance-container .amount,.amount-text,#nav-robux-balance').forEach(el=>{
+                el.classList.add('larp-faked');el.style.visibility='visible';
+            });
+
+            applyIdentityFakes();
+
+        } catch(e){console.error('[LARP] applyFakes:',e);}
+        finally{isUpdating=false;if(observer)observer.observe(document.body,{childList:true,subtree:true,characterData:true});}
+    }
+
+    // =====================================================================
+    // FAKE BUY
+    // =====================================================================
+    function setupFakeBuy(){
+        document.body.addEventListener('click',e=>{
+            const btn=e.target.closest('.btn-growth-lg,.item-purchase-button,[data-testid="purchase-button"],.PurchaseButton,.larp-buy-btn-injected');
+            if(!btn||btn.classList.contains('larp-handled')||btn.textContent.includes('Owned'))return;
+            e.preventDefault();e.stopPropagation();processFakeBuy();
+        },true);
+        setInterval(()=>{
+            if(!/\/(catalog|bundles|assets)\//.test(win.location.href))return;
+            const c=document.querySelector('.item-purchase-section,[data-testid="item-purchase-section"],.action-button-container');
+            if(!c||c.querySelector('.larp-buy-btn-injected'))return;
+            const ex=c.querySelector('.btn-growth-lg,.item-purchase-button,[data-testid="purchase-button"]');
+            if(!ex||ex.textContent.includes('Off-sale')||ex.disabled){
+                const b=document.createElement('button');b.className='larp-buy-btn-injected';b.textContent='Buy with Robux (LARP)';
+                if(ex)ex.style.display='none';c.appendChild(b);
+            }
+        },1000);
+    }
+
+    function processFakeBuy(){
+        const prEl=document.querySelector('.item-price-value,[data-testid="item-price"],.text-robux-lg');
+        const nmEl=document.querySelector('.item-name-container h1,[data-testid="item-name"],.item-name');
+        const crEl=document.querySelector('.item-name-container .text-name,[data-testid="item-creator"],.seller-name,.attribution-container a');
+        const mc=document.getElementById('container-main')||document.querySelector('.item-details')||document;
+        let thumb='';
+        const tImg=mc.querySelector('.thumbnail-2d-container img,[data-testid="item-image"] img,#item-details-thumbnail-container img');
+        if(tImg?.src&&!tImg.src.includes('clear.png'))thumb=tImg.src;
+        else{const og=document.querySelector('meta[property="og:image"]');if(og)thumb=og.content;}
+        const price=parseInt((prEl?.textContent||'0').replace(/[^0-9]/g,''))||0;
+        const name=nmEl?.textContent.trim()||'Unknown Item';
+        const creator=crEl?.textContent.trim()||'Roblox';
+        const im=win.location.href.match(/\/(catalog|bundles|assets)\/(\d+)\//);
+        const itemId=im?im[2]:'0';
+        showConfirmModal(name,price,thumb,creator,ok=>{
+            if(!ok)return;
+            let bal=parseInt(config.robux.replace(/[^0-9]/g,''))||0;
+            if(bal<price){showErrorModal('Insufficient Robux',`Need ${formatNum(price-bal)} more.`);return;}
+            bal-=price;config.robux=formatNum(bal);
+            const now=new Date(),p2=n=>n.toString().padStart(2,'0');
+            config.purchasedHistory.unshift({id:itemId,name,price,date:`${p2(now.getMonth()+1)}/${p2(now.getDate())}/${now.getFullYear().toString().slice(-2)} ${now.toLocaleTimeString([],{hour:'numeric',minute:'2-digit',hour12:true})}`,thumb,creator});
+            if(!config.limiteds.find(i=>i.id===itemId))config.limiteds.push({id:itemId,name,thumb,equipped:true,isLimited:true,price:formatNum(price)});
+            saveConfig();showSuccessModal(name,price,thumb,creator,formatNum(bal));applyFakes();
+        });
+    }
+
+    function injectModalStyles(){
+        if(document.getElementById('larp-mstyle'))return;
+        const s=document.createElement('style');s.id='larp-mstyle';
+        s.textContent=`#larp-buy-overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:"HCo Gotham SSm","Helvetica Neue",Helvetica,Arial,sans-serif;}#larp-buy-modal{width:440px;background:#2b2d2f;overflow:hidden;box-shadow:0 15px 50px rgba(0,0,0,.8);border:1px solid #3c3e41;}.lmh{padding:8px 14px;border-bottom:1px solid #393b3d;display:flex;justify-content:space-between;align-items:center;}.lmh h2{margin:0;font-size:16px;font-weight:700;color:#fff;}.lmx{font-size:28px;color:#adb5bd;cursor:pointer;line-height:1;}.lmb{padding:10px 14px 0;}.lmb p{color:#fff;font-size:15px;font-weight:500;line-height:1.4;margin-bottom:4px;}.lmt{width:140px;height:140px;background:#3a3c3e;margin:15px auto 20px;display:flex;align-items:center;justify-content:center;}.lmt img{width:100%;height:100%;object-fit:contain;}.lma{display:flex;justify-content:center;gap:12px;}.lmbuy{width:145px;height:40px;background:#fff;color:#000;border:none;font-weight:600;cursor:pointer;font-size:14px;}.lmcan{width:145px;height:40px;background:#3f4245;color:#fff;border:none;font-weight:700;cursor:pointer;font-size:14px;}.lmf{padding:8px 14px 22px;text-align:center;font-size:11px;font-weight:600;color:#9fa2a4;}.lmi{display:inline-flex;align-items:center;gap:4px;}`;
+        document.head.appendChild(s);
+    }
+    function showConfirmModal(name,price,thumb,creator,cb){
+        removeModals();injectModalStyles();
+        const bal=parseInt(config.robux.replace(/[^0-9]/g,''))||0;
+        const ov=document.createElement('div');ov.id='larp-buy-overlay';
+        ov.innerHTML=`<div id="larp-buy-modal"><div class="lmh"><h2>Buy Item</h2><span class="lmx">&times;</span></div><div class="lmb"><p>Buy "<strong>${name}</strong>" from ${creator} for <span class="lmi"><span class="icon-robux-white-16x16"></span>${formatNum(price)}?</span></p><div class="lmt"><img src="${thumb}"></div><div class="lma"><button class="lmbuy">Buy Now</button><button class="lmcan">Cancel</button></div></div><div class="lmf">Balance after: <span class="lmi"><span class="icon-robux-white-16x16" style="filter:brightness(0.65) grayscale(1);"></span>${formatNum(bal-price)}</span></div></div>`;
+        document.body.appendChild(ov);
+        ov.querySelector('.lmx').onclick=ov.querySelector('.lmcan').onclick=()=>{ov.remove();cb(false);};
+        ov.querySelector('.lmbuy').onclick=()=>{ov.remove();cb(true);};
+    }
+    function showSuccessModal(name,price,thumb,creator,balStr){
+        removeModals();injectModalStyles();
+        const ov=document.createElement('div');ov.id='larp-buy-overlay';
+        ov.innerHTML=`<div id="larp-buy-modal"><div class="lmh"><h2>Purchase Complete</h2><span class="lmx">&times;</span></div><div class="lmb"><p>Acquired <strong>${name}</strong> from ${creator} for <span class="lmi"><span class="icon-robux-white-16x16"></span>${formatNum(price)}</span></p><div class="lmt"><img src="${thumb}"></div><div class="lma"><button id="larp-customize" class="lmbuy">Customize</button><button id="larp-not-now" class="lmcan">Not Now</button></div></div><div class="lmf">New balance: <span class="lmi"><span class="icon-robux-white-16x16" style="filter:brightness(0.65) grayscale(1);"></span>${balStr}</span></div></div>`;
+        document.body.appendChild(ov);
+        ov.querySelector('.lmx').onclick=document.getElementById('larp-not-now').onclick=()=>ov.remove();
+        document.getElementById('larp-customize').onclick=()=>{ov.remove();win.location.href='/my/avatar';};
+    }
+    function showErrorModal(title,msg){
+        removeModals();
+        const m=document.createElement('div');m.id='larp-purchase-modal';
+        Object.assign(m.style,{position:'fixed',top:'0',left:'0',width:'100%',height:'100%',backgroundColor:'rgba(0,0,0,0.8)',zIndex:'2147483647',display:'flex',alignItems:'center',justifyContent:'center'});
+        m.innerHTML=`<div style="background:#1e1e1e;padding:30px;width:400px;text-align:center;border:1px solid #333;font-family:'Segoe UI',sans-serif;"><div style="width:60px;height:60px;background:#ef4444;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></div><h2 style="color:#fff;margin-bottom:10px;">${title}</h2><p style="color:#bbb;font-size:14px;margin-bottom:25px;">${msg}</p><button id="larp-ok" style="width:100%;padding:12px;border:none;background:#333;color:#fff;cursor:pointer;font-weight:700;">OK</button></div>`;
+        document.body.appendChild(m);
+        document.getElementById('larp-ok').onclick=()=>m.remove();
+    }
+    function removeModals(){['larp-purchase-modal','larp-buy-overlay'].forEach(id=>document.getElementById(id)?.remove());}
+
+    // =====================================================================
+    // OBSERVER + KEYBOARD
+    // =====================================================================
+    const throttledApply = throttle(applyFakes, 200);
+    observer = new MutationObserver(mutations=>{
+        for(const m of mutations){
+            const t=m.target.nodeType===3?m.target.parentElement:m.target;
+            if(!t||t.closest('#larp-menu,#larp-gear-btn,#larp-purchase-modal'))continue;
+            throttledApply();break;
+        }
+    });
+
+    win.addEventListener('keydown',e=>{
+        if((e.key==='+'||e.key==='0')&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
+            e.preventDefault();
+            if(!document.getElementById('larp-menu'))createUI();
+            const m=document.getElementById('larp-menu');
+            m.style.display=m.style.display==='none'?'block':'none';
+        }
+    },true);
+
+    const init=()=>{
+        if(!document.body){setTimeout(init,50);return;}
+        createUI();setupFakeBuy();applyFakes();
+        observer.observe(document.body,{childList:true,subtree:true,characterData:true});
+        console.log('%c[LARP] v1.9 Ready.','color:#a855f7;font-weight:bold;');
+    };
+
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);
+    else init();
+})();
